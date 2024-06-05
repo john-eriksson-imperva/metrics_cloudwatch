@@ -8,6 +8,10 @@ use crate::{
     BoxFuture,
 };
 
+pub(crate) const MAX_CW_METRICS_PER_CALL: usize = 1000;
+pub(crate) const MAX_CLOUDWATCH_DIMENSIONS: usize = 30;
+pub(crate) const MAX_HISTOGRAM_VALUES: usize = 150;
+
 pub struct Builder {
     cloudwatch_namespace: Option<String>,
     default_dimensions: BTreeMap<String, String>,
@@ -16,6 +20,9 @@ pub struct Builder {
     shutdown_signal: Option<BoxFuture<'static, ()>>,
     metric_buffer_size: usize,
     force_flush_stream: Option<Pin<Box<dyn Stream<Item = ()> + Send>>>,
+    pub max_cw_metrics_per_call: usize,
+    pub max_histogram_values: usize,
+    pub max_cloudwatch_dimensions: usize,
 }
 
 fn extract_namespace(cloudwatch_namespace: Option<String>) -> Result<String, Error> {
@@ -37,6 +44,9 @@ impl Builder {
             shutdown_signal: Default::default(),
             metric_buffer_size: 2048,
             force_flush_stream: Default::default(),
+            max_cw_metrics_per_call: MAX_CW_METRICS_PER_CALL,
+            max_histogram_values: MAX_HISTOGRAM_VALUES,
+            max_cloudwatch_dimensions: MAX_CLOUDWATCH_DIMENSIONS,
         }
     }
 
@@ -104,6 +114,27 @@ impl Builder {
         }
     }
 
+    pub fn max_cw_metrics_per_call(self, max_cw_metrics_per_call: usize) -> Self {
+        Self {
+            max_cw_metrics_per_call,
+            ..self
+        }
+    }
+
+    pub fn max_histogram_values(self, max_histogram_values: usize) -> Self {
+        Self {
+            max_histogram_values,
+            ..self
+        }
+    }
+
+    pub fn max_cloudwatch_dimensions(self, max_cloudwatch_dimensions: usize) -> Self {
+        Self {
+            max_cloudwatch_dimensions,
+            ..self
+        }
+    }
+
     /// Initializes the CloudWatch metrics backend and runs it in a new thread.
     ///
     /// Expects the `metrics::set_boxed_recorder` function as an argument as a safeguard against
@@ -159,6 +190,9 @@ impl Builder {
                 .shared(),
             metric_buffer_size: self.metric_buffer_size,
             force_flush_stream: self.force_flush_stream,
+            max_cw_metrics_per_call: self.max_cw_metrics_per_call,
+            max_histogram_values: self.max_histogram_values,
+            max_cloudwatch_dimensions: self.max_cloudwatch_dimensions,
         })
     }
 }
@@ -173,6 +207,9 @@ impl fmt::Debug for Builder {
             shutdown_signal: _,
             metric_buffer_size,
             force_flush_stream: _,
+            max_cw_metrics_per_call,
+            max_histogram_values,
+            max_cloudwatch_dimensions,
         } = self;
         f.debug_struct("Builder")
             .field("cloudwatch_namespace", cloudwatch_namespace)
@@ -182,6 +219,9 @@ impl fmt::Debug for Builder {
             .field("shutdown_signal", &"BoxFuture")
             .field("metric_buffer_size", metric_buffer_size)
             .field("force_flush_stream", &"dyn Stream")
+            .field("max_cw_metrics_per_call", max_cw_metrics_per_call)
+            .field("max_histogram_values", max_histogram_values)
+            .field("max_cloudwatch_dimensions", max_cloudwatch_dimensions)
             .finish()
     }
 }

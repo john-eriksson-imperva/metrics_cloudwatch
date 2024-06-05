@@ -60,25 +60,29 @@ type HistogramValue = ordered_float::NotNan<f64>;
 type Timestamp = u64;
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
-const MAX_CW_METRICS_PER_CALL: usize = 1000;
-const MAX_CLOUDWATCH_DIMENSIONS: usize = 30;
-const MAX_HISTOGRAM_VALUES: usize = 150;
 const MAX_CW_METRICS_PUT_SIZE: usize = 800_000; // Docs say 1Mb but we set our max lower to be safe since we only have a heuristic
 const SEND_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub struct Config {
     pub cloudwatch_namespace: String,
+
     pub default_dimensions: BTreeMap<String, String>,
     pub storage_resolution: Resolution,
     pub send_interval_secs: u64,
     pub shutdown_signal: future::Shared<BoxFuture<'static, ()>>,
     pub metric_buffer_size: usize,
     pub force_flush_stream: Option<Pin<Box<dyn Stream<Item = ()> + Send>>>,
+
+    pub max_cw_metrics_per_call: usize,
+    pub max_histogram_values: usize,
+    pub max_cloudwatch_dimensions: usize,
 }
 
 struct CollectorConfig {
     default_dimensions: BTreeMap<String, String>,
     storage_resolution: Resolution,
+    max_cloudwatch_dimensions: usize,
+    max_histogram_values: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -222,11 +226,18 @@ pub fn new(
         .take_until(config.shutdown_signal.clone().map(|_| true)),
     );
 
-    let emitter = mk_emitter(emit_receiver, client, config.cloudwatch_namespace);
+    let emitter = mk_emitter(
+        emit_receiver,
+        client,
+        config.cloudwatch_namespace,
+        config.max_cw_metrics_per_call,
+    );
 
     let internal_config = CollectorConfig {
         default_dimensions: config.default_dimensions,
         storage_resolution: config.storage_resolution,
+        max_cloudwatch_dimensions: config.max_cloudwatch_dimensions,
+        max_histogram_values: config.max_histogram_values,
     };
 
     let mut collector = Collector::new(internal_config);
@@ -272,11 +283,12 @@ async fn mk_emitter(
     mut emit_receiver: mpsc::Receiver<Vec<MetricDatum>>,
     cloudwatch_client: impl CloudWatch,
     cloudwatch_namespace: String,
+    max_cw_metrics_per_call: usize,
 ) {
     let cloudwatch_client = &cloudwatch_client;
     let cloudwatch_namespace = &cloudwatch_namespace;
     while let Some(metrics) = emit_receiver.recv().await {
-        let chunks: Vec<_> = metrics_chunks(&metrics).collect();
+        let chunks: Vec<_> = metrics_chunks(&metrics, max_cw_metrics_per_call).collect();
         stream::iter(chunks)
             .for_each(|metric_data| async move {
                 let send_fut = retry_on_throttled(|| async {
@@ -305,7 +317,10 @@ async fn mk_emitter(
     }
 }
 
-fn fit_metrics<'a>(metrics: impl IntoIterator<Item = &'a MetricDatum>) -> usize {
+fn fit_metrics<'a>(
+    metrics: impl IntoIterator<Item = &'a MetricDatum>,
+    max_cw_metrics_per_call: usize,
+) -> usize {
     let mut split = 0;
 
     let mut current_len = 0;
@@ -317,7 +332,7 @@ fn fit_metrics<'a>(metrics: impl IntoIterator<Item = &'a MetricDatum>) -> usize 
     // ```
     for (i, metric) in metrics
         .into_iter()
-        .take(MAX_CW_METRICS_PER_CALL)
+        .take(max_cw_metrics_per_call)
         .enumerate()
     {
         current_len += metric_size(metric);
@@ -329,9 +344,12 @@ fn fit_metrics<'a>(metrics: impl IntoIterator<Item = &'a MetricDatum>) -> usize 
     split
 }
 
-fn metrics_chunks(mut metrics: &[MetricDatum]) -> impl Iterator<Item = &[MetricDatum]> + '_ {
+fn metrics_chunks(
+    mut metrics: &[MetricDatum],
+    max_cw_metrics_per_call: usize,
+) -> impl Iterator<Item = &[MetricDatum]> + '_ {
     std::iter::from_fn(move || {
-        let split = fit_metrics(metrics);
+        let split = fit_metrics(metrics, max_cw_metrics_per_call);
         let (chunk, rest) = metrics.split_at(split);
         metrics = rest;
         if chunk.is_empty() {
@@ -546,11 +564,11 @@ impl Collector {
         }
         all_dims.retain(|dim| !dim.value().unwrap_or("").is_empty());
 
-        if all_dims.len() > MAX_CLOUDWATCH_DIMENSIONS {
-            all_dims.truncate(MAX_CLOUDWATCH_DIMENSIONS);
+        if all_dims.len() > self.config.max_cloudwatch_dimensions {
+            all_dims.truncate(self.config.max_cloudwatch_dimensions);
             log::warn!(
                 "Too many dimensions, taking only {}",
-                MAX_CLOUDWATCH_DIMENSIONS
+                self.config.max_cloudwatch_dimensions
             );
         }
 
@@ -669,7 +687,7 @@ impl Collector {
                         count: v as f64,
                     });
                     loop {
-                        let histogram = histogram_data.take(MAX_HISTOGRAM_VALUES).fold(
+                        let histogram = histogram_data.take(self.config.max_histogram_values).fold(
                             Histogram::default(),
                             |mut memo, datum| {
                                 memo.values.push(datum.value);
@@ -785,7 +803,11 @@ mod tests {
 
     use super::*;
 
+    use crate::builder::{
+        MAX_CLOUDWATCH_DIMENSIONS, MAX_CW_METRICS_PER_CALL, MAX_HISTOGRAM_VALUES,
+    };
     use proptest::prelude::*;
+
     fn dim(name: &str, value: &str) -> Dimension {
         Dimension::builder().name(name).value(value).build()
     }
@@ -832,7 +854,7 @@ mod tests {
             proptest::prelude::ProptestConfig { cases: 30, .. Default::default() },
             |(metrics in metrics())| {
                 let mut total_chunks = 0;
-                for metric_data in metrics_chunks(&metrics) {
+                for metric_data in metrics_chunks(&metrics, MAX_CW_METRICS_PER_CALL) {
                     assert!(metric_data.len() > 0 && metric_data.len() < MAX_CW_METRICS_PER_CALL, "Sending too many metrics per call: {}", metric_data.len());
                     let estimated_size = metric_data.iter().map(metric_size).sum::<usize>();
                     assert!(estimated_size < MAX_CW_METRICS_PUT_SIZE, "{} >= {}", estimated_size, MAX_CW_METRICS_PUT_SIZE);
@@ -853,6 +875,8 @@ mod tests {
             .into_iter()
             .collect(),
             storage_resolution: Resolution::Minute,
+            max_cloudwatch_dimensions: MAX_CLOUDWATCH_DIMENSIONS,
+            max_histogram_values: MAX_HISTOGRAM_VALUES,
         });
 
         let key = Key::from_parts(
